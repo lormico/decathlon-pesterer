@@ -1,6 +1,7 @@
 import csv
 import json
 import urllib.request
+import threading
 from dataclasses import dataclass
 from typing import List, Dict
 
@@ -26,6 +27,14 @@ class Product:
     availability: Dict[str, bool] = None
 
 
+def thread_function(formatted_url, product):
+    with urllib.request.urlopen(formatted_url) as url:
+        data = json.loads(url.read().decode())
+        physical_store = PhysicalStore(*data['physicalStoreList'][0])
+        product.availability[physical_store.store_name] = bool(
+            physical_store.store_availability != 'N')
+
+
 def main():
     products: List[Product] = list()
     store_ids: List[str] = list()
@@ -42,9 +51,11 @@ def main():
         for row in stores_csv:
             store_ids.append(row[0])
 
+    threads = list()
+    print("Creo i thread...")
     for product in products:
-        print("Product %s..." % product.product_id)
         product.availability = dict()
+
         for store_full_id in store_ids:
             formatted_url = URLFMT.format(
                 storeFullId=store_full_id,
@@ -52,14 +63,18 @@ def main():
                 timestamp="0"
             )
 
-            with urllib.request.urlopen(formatted_url) as url:
-                data = json.loads(url.read().decode())
-                physical_store = PhysicalStore(*data['physicalStoreList'][0])
-                product.availability[physical_store.store_name] = bool(physical_store.store_availability != 'N')
-                # print("\t" + physical_store.store_name)
+            thread = threading.Thread(
+                target=thread_function, args=(formatted_url, product))
+            threads.append(thread)
+            thread.start()  # begin thread execution
 
-        for k,v in product.availability.items():
-            print("%s: %s" % (k, v))
+    for thread in threads:
+        thread.join()
+
+    for product in products:
+        if any(product.availability.values()):
+            print(
+                f"{product.name} {product.color} taglia {product.size} disponibile presso: {[x for x in product.availability.keys() if product.availability[x]]}")
 
 
 if __name__ == "__main__":
