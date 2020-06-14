@@ -1,25 +1,17 @@
 """
-Chiede a Decathlon la disponibilità dei prodotti censiti in DB nei negozi censiti su csv.
+Chiede a Decathlon la disponibilità dei prodotti nei negozi censiti in DB.
 Se trova differenze dall'ultima esecuzione, notifica.
 """
 
 import concurrent.futures
 import json
 import sqlite3
+import sys
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 URLFMT = "https://www.decathlon.it/it/ChooseStore_getStoresWithAvailability?storeFullId={storeFullId}&productId={productId}&_={timestamp}"
-
-CREATE_STATEMENT = """ CREATE TABLE IF NOT EXISTS products (
-                        id integer PRIMARY KEY,
-                        name text NOT NULL,
-                        color text,
-                        size text,
-                        availability text
-                    ); """
-
 
 @dataclass
 class Store:
@@ -54,7 +46,7 @@ class ProductAvailability:
 
 
 def thread_function(product: Product, store: Store) -> ProductAvailability:
-    """ Recupera la disponibilità da Decathlon e aggiorna il prodotto """
+    """ Recupera la disponibilità da Decathlon e restituisce un oggetto con le informazioni"""
     formatted_url = URLFMT.format(
         storeFullId=store.store_full_id,
         productId=product.product_id,
@@ -171,9 +163,14 @@ def main(only_favs=True):
             insert_product_availability(conn, product_availability)
         elif old_availability.availability != product_availability.availability:
             update_product_availability(conn, product_availability)
+            # invia mail di cambio disponibilità
+            # se la disponibilità è >1, invia mail urgente (?)
 
     conn.commit()
 
 
 if __name__ == "__main__":
-    main(only_favs=False)
+    only_favs = True
+    if len(sys.argv) > 1 and sys.argv[1] == '-a':
+        only_favs = False
+    main(only_favs)
