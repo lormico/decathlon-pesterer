@@ -4,7 +4,6 @@ Se trova differenze dall'ultima esecuzione, notifica.
 """
 
 import copy
-import csv
 import json
 import sqlite3
 import threading
@@ -21,6 +20,13 @@ CREATE_STATEMENT = """ CREATE TABLE IF NOT EXISTS products (
                         size text,
                         availability text
                     ); """
+
+
+@dataclass
+class Store:
+    store_full_id: str
+    store_id: int
+    store_description: str
 
 
 @dataclass
@@ -53,6 +59,9 @@ def thread_function(product: Product, store_full_id: str):
     with urllib.request.urlopen(formatted_url) as url:
         data = json.loads(url.read().decode())
         physical_store = PhysicalStore(*data['physicalStoreList'][0])
+        products_list = data['nbProductsList']
+        print("%s %s %s a %s: %s" %
+              (product.name, product.color, product.size, physical_store.store_name, physical_store.store_availability))
         if physical_store.store_availability == 'Y':
             product.availability.append(store_full_id)
 
@@ -66,6 +75,13 @@ def create_connection(db_file: str) -> Optional[sqlite3.Connection]:
     except Exception as e:
         print(e)
     return conn
+
+
+def get_stores(conn: sqlite3.Connection) -> List[Store]:
+    cur = conn.cursor()
+    cur.execute("""SELECT store_full_id, store_id, store_description FROM stores""")
+    stores: List[Store] = [Store(*row) for row in cur.fetchall()]
+    return stores
 
 
 def get_products(conn: sqlite3.Connection) -> List[Product]:
@@ -92,27 +108,23 @@ def main():
     conn = create_connection('status.db')
     old_products: List[Product] = get_products(conn)
     new_products: List[Product] = copy.deepcopy(old_products)
-    store_ids: List[str] = list()
-
-    with open('stores.csv', encoding='utf-8-sig') as stores_file:
-        stores_file.readline()
-        stores_csv = csv.reader(stores_file, delimiter=';')
-        for row in stores_csv:
-            store_ids.append(row[0])
+    stores: List[Store] = get_stores(conn)
 
     threads = list()
     print("Creo i thread...")
     for product in new_products:
         product.availability = list()
 
-        for store_full_id in store_ids:
+        for store in stores:
             thread = threading.Thread(
-                target=thread_function, args=(product, store_full_id))
+                target=thread_function, args=(product, store.store_full_id))
             threads.append(thread)
             thread.start()  # begin thread execution
 
     for thread in threads:
         thread.join()
+
+    print("Terminata scansione da Decathlon.it")
 
     for old_product, new_product in zip(old_products, new_products):
         old_product.availability.sort()
