@@ -3,10 +3,9 @@ Chiede a Decathlon la disponibilità dei prodotti censiti in DB nei negozi censi
 Se trova differenze dall'ultima esecuzione, notifica.
 """
 
-import copy
+import concurrent.futures
 import json
 import sqlite3
-import threading
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -45,13 +44,19 @@ class Product:
     name: str
     color: str
     size: str
-    availability: List[str] = field(default_factory=list)
 
 
-def thread_function(product: Product, store_full_id: str):
+@dataclass(order=True)
+class ProductAvailability:
+    product_id: str
+    store_id: int
+    availability: int = 0
+
+
+def thread_function(product: Product, store: Store) -> ProductAvailability:
     """ Recupera la disponibilità da Decathlon e aggiorna il prodotto """
     formatted_url = URLFMT.format(
-        storeFullId=store_full_id,
+        storeFullId=store.store_full_id,
         productId=product.product_id,
         timestamp="0"
     )
@@ -59,11 +64,17 @@ def thread_function(product: Product, store_full_id: str):
     with urllib.request.urlopen(formatted_url) as url:
         data = json.loads(url.read().decode())
         physical_store = PhysicalStore(*data['physicalStoreList'][0])
-        products_list = data['nbProductsList']
-        print("%s %s %s a %s: %s" %
-              (product.name, product.color, product.size, physical_store.store_name, physical_store.store_availability))
-        if physical_store.store_availability == 'Y':
-            product.availability.append(store_full_id)
+        products_list: dict = data['nbProductsList']
+        store_id = list(products_list.keys())[
+            0] if products_list else store.store_id
+        availability = products_list.get(store_id, 0)
+
+        print("%s %s %s a %s: %s (%d)" %
+              (product.name, product.color, product.size,
+               physical_store.store_name, physical_store.store_availability,
+               availability))
+
+        return ProductAvailability(product.product_id, store_id, availability)
 
 
 def create_connection(db_file: str) -> Optional[sqlite3.Connection]:
@@ -77,63 +88,92 @@ def create_connection(db_file: str) -> Optional[sqlite3.Connection]:
     return conn
 
 
-def get_stores(conn: sqlite3.Connection) -> List[Store]:
+def get_stores(conn: sqlite3.Connection, only_favs=True) -> List[Store]:
     cur = conn.cursor()
-    cur.execute("""SELECT store_full_id, store_id, store_description FROM stores""")
+    query = """SELECT store_full_id, store_id, store_description FROM stores"""
+    if only_favs:
+        query += """ WHERE favorite = 'Y'"""
+    cur.execute(query)
     stores: List[Store] = [Store(*row) for row in cur.fetchall()]
     return stores
 
 
-def get_products(conn: sqlite3.Connection) -> List[Product]:
+def get_products(conn: sqlite3.Connection, only_favs=True) -> List[Product]:
     cur = conn.cursor()
-    cur.execute("""SELECT id, name, color, size, availability FROM products""")
-    products: List[Product] = list()
-    for row in cur.fetchall():
-        product = Product(*row[:-1])
-        product.availability = row[-1].split(',') if row[-1] != '' else []
-        products.append(product)
-
+    query = """SELECT id, name, color, size FROM products"""
+    if only_favs:
+        query += """ WHERE favorite = 'Y'"""
+    cur.execute(query)
+    products: List[Product] = [Product(*row) for row in cur.fetchall()]
     return products
 
 
-def update_product(conn: sqlite3.Connection, product: Product):
-    print("Aggiornamento della disponibilità del prodotto %s" %
-          product.product_id)
+def get_product_availability(conn: sqlite3.Connection, product_availability: ProductAvailability) -> Optional[ProductAvailability]:
     cur = conn.cursor()
-    cur.execute("""UPDATE products SET availability = ? WHERE id = ?""",
-                (','.join(product.availability), product.product_id))
+    query = """SELECT product_id, store_id, availability FROM product_availability WHERE product_id = ? AND store_id = ?"""
+    cur.execute(query, (product_availability.product_id,
+                        product_availability.store_id))
+    result = cur.fetchone()
+    if result:
+        return ProductAvailability(*result)
+    else:
+        return None
 
 
-def main():
+def update_product_availability(conn: sqlite3.Connection, product_availability: ProductAvailability):
+    print("Aggiornamento della disponibilità del prodotto %s" %
+          product_availability.product_id)
+    cur = conn.cursor()
+    cur.execute("""UPDATE product_availability SET availability = ? WHERE product_id = ? AND store_id = ?""",
+                (
+                    product_availability.availability,
+                    product_availability.product_id,
+                    product_availability.store_id
+                )
+                )
+
+
+def insert_product_availability(conn: sqlite3.Connection, product_availability: ProductAvailability):
+    print("Inserimento della disponibilità del prodotto %s precedentemente non censita" %
+          product_availability.product_id)
+    cur = conn.cursor()
+    cur.execute("""INSERT INTO product_availability (product_id, store_id, availability) VALUES (?,?,?)""",
+                (
+                    product_availability.product_id,
+                    product_availability.store_id,
+                    product_availability.availability
+                )
+                )
+
+
+def main(only_favs=True):
     conn = create_connection('status.db')
-    old_products: List[Product] = get_products(conn)
-    new_products: List[Product] = copy.deepcopy(old_products)
-    stores: List[Store] = get_stores(conn)
+    products: List[Product] = get_products(conn, only_favs)
+    stores: List[Store] = get_stores(conn, only_favs)
 
-    threads = list()
     print("Creo i thread...")
-    for product in new_products:
-        product.availability = list()
+    product_availabilities: List[ProductAvailability] = list()
+    futures: List[concurrent.futures.Future] = list()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        for product in products:
+            for store in stores:
+                futures.append(executor.submit(
+                    thread_function, product, store))
 
-        for store in stores:
-            thread = threading.Thread(
-                target=thread_function, args=(product, store.store_full_id))
-            threads.append(thread)
-            thread.start()  # begin thread execution
-
-    for thread in threads:
-        thread.join()
+        product_availabilities = [f.result() for f in futures]
 
     print("Terminata scansione da Decathlon.it")
 
-    for old_product, new_product in zip(old_products, new_products):
-        old_product.availability.sort()
-        new_product.availability.sort()
-        if old_product.availability != new_product.availability:
-            update_product(conn, new_product)
+    for product_availability in product_availabilities:
+        old_availability: ProductAvailability = get_product_availability(
+            conn, product_availability)
+        if not old_availability:
+            insert_product_availability(conn, product_availability)
+        elif old_availability.availability != product_availability.availability:
+            update_product_availability(conn, product_availability)
 
     conn.commit()
 
 
 if __name__ == "__main__":
-    main()
+    main(only_favs=False)
